@@ -1,0 +1,32 @@
+﻿<link rel="stylesheet" href="~/Content/bootstrap.min.css" />
+<link rel="stylesheet" href="~/Content/Site.css" />
+@model Accounting.WebUI.Models.AccountViewModel
+@{
+    ViewBag.Title = "AccountBalance";
+}
+<div>
+    <h1>Account Balance</h1>
+    @using (Html.BeginForm("GetBalance", "Account", FormMethod.Post, new { @class = "form-horizontal" }))
+    {
+        <div class="form-group">
+            @Html.LabelFor(x => x.AccountNumber, new { @class = "col-sm-2 control-label" })
+            @Html.TextBoxFor(x => x.AccountNumber, new { @class = "form-control" })
+        </div>
+
+        <div class="form-group">
+            @Html.LabelFor(x => x.AccountBalance, new { @class = "col-sm-2 control-label" })
+            <div class="col-sm-10">
+                <label class="form-control-static">@string.Format("{0:C}", Model.AccountBalance)</label>
+            </div>
+        </div>
+
+            <div class="form-group">
+                <div class="col-sm-offset-2 col-sm-10">
+
+                    <button type="submit" class="btn btn-default"> Submit</button>
+                </div>
+            </div>
+    }
+
+</div>
+
