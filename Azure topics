@@ -1,0 +1,249 @@
+//-----------------------------------------------------------------------
+// <copyright file="WorkerRole.cs" company="Microsoft">
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
+// </copyright>
+//-----------------------------------------------------------------------
+namespace Microsoft.CloudInfrastructure.POLifeCycleWorkerRole
+{
+    using System;
+    using System.Configuration;
+    using System.Diagnostics;
+    using System.Linq;
+    using System.Threading;
+
+    using EventProcessor.Receiver;
+    using Microsoft.Azure;
+    using Microsoft.CloudInfrastructure.POLifeCycle;
+    using Microsoft.CloudInfrastructure.POLifeCycle.Helpers;
+    using Microsoft.Cloud.InstrumentationFramework;
+    using Microsoft.WindowsAzure.ServiceRuntime;
+    using MonitoringAndLogging;
+    using SecurityHelper;
+
+    /// <summary>Worker role object.</summary>
+    public class WorkerRole : RoleEntryPoint
+    {
+        #region
+
+        /// <summary>The metric data type default.</summary>
+        private const string MetricDataTypeDefault = "Trace";
+
+        #endregion
+        #region Fields - ReadOnly
+
+        /// <summary>CancellationTokenSource stops worker role.</summary>
+        private readonly CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+
+        /// <summary>The service role instance.</summary>
+        private readonly Lazy<RoleInstance> serviceRoleInstance = new Lazy<RoleInstance>(() => RoleEnvironment.CurrentRoleInstance);
+
+        #endregion
+        #region Fields
+
+        /// <summary> Number of retry before message will be placed to dead letter queue. </summary>
+        private int numberOfRetry = 11;
+
+        /// <summary>Event stops worker role.</summary>
+        private readonly ManualResetEvent completedEvent = new ManualResetEvent(false);
+
+        /// <summary>The heartbeat.</summary> 
+        private Heartbeat heartbeat;
+
+        #endregion
+        #region Properties
+
+        /// <summary>The service role instance.</summary>
+        public RoleInstance ServiceRoleInstance
+        {
+            get
+            {
+                return this.serviceRoleInstance.Value;
+            }
+        }
+
+        #endregion
+        #region Methods - Public - Override
+        /// <summary>Runs worker role.</summary>
+        public override void Run()
+        {
+            const string RunWorkerRoleOperationName = "Run Worker Role";
+            Trace.TraceInformation("{0}|{1}|Run {2}...", MetricDataTypeDefault, RunWorkerRoleOperationName, this.ServiceRoleInstance.Id);
+            using (var runWorkerRoleOperation = new Operation(RunWorkerRoleOperationName))
+            {
+                try
+                {
+                    while (!this.cancellationTokenSource.Token.IsCancellationRequested)
+                    {
+                        var masterId = this.ServiceRoleInstance.Role.Instances.OrderBy(ins => ins.Id).First().Id;
+                        var isMaster = this.ServiceRoleInstance.Id.Equals(masterId);
+                        if (isMaster)
+                        {
+                            Trace.TraceInformation("{0}|{1}|Start processing messages...", MetricDataTypeDefault, RunWorkerRoleOperationName);
+                            var connectionStr = ConfigurationHelper.AzureServiceBus;
+                            var topicName = CloudConfigurationManager.GetSetting("AzureServiceBusTopicName");
+                            var subscriptionName =
+                                CloudConfigurationManager.GetSetting("ServiceBusTopicListener");
+                            var storageConnectionString = ConfigurationHelper.AzureBlobConnectionString;
+                            var receiver = new EventReceiver<CommunicationMessage>(
+                                connectionStr,
+                                storageConnectionString,
+                                ConfigurationManager.AppSettings["ConfigEnvironment"],
+                                topicName,
+                                subscriptionName);
+                            var dispatcher = new Dispatcher();
+                            receiver.Receive(
+                                (m, inf) =>
+                                    {
+                                        ImpersonationHelper
+                                            .InvokeActionAsImpersonatedUserForRemoteResource<object, object>(
+                                                ConfigurationHelper.AxUserName,
+                                                ConfigurationHelper.AxUserDomain,
+                                                ConfigurationHelper.AxUserPassword,
+                                                f =>
+                                                    {
+                                                        const string ActivityOperationName = "Execute Activity";
+                                                        using (var executeActivtyOperation = new Operation(ActivityOperationName))
+                                                        {
+                                                            try
+                                                            {
+                                                                Trace.TraceInformation("{0}|{1}|Getting workflow for activity {2}", MetricDataTypeDefault, ActivityOperationName, m.Destination);
+                                                                var activity = dispatcher.GetActivity(m.Destination);
+                                                                Trace.TraceInformation("{0}|{1}|Starting workflow execution. Workflow type : {2}", MetricDataTypeDefault, ActivityOperationName, activity.GetType().Name);
+                                                                Trace.TraceInformation("{0}|{1}|Message received : {2}", MetricDataTypeDefault, ActivityOperationName, m.Payload);
+                                                                activity.Execute(m.Payload);
+                                                                Trace.TraceInformation("{0}|{1}|Workflow execution finished.", MetricDataTypeDefault, ActivityOperationName);
+                                                                executeActivtyOperation.SetResult(OperationResult.Success);
+                                                                return null;
+                                                            }
+                                                            catch (Exception e)
+                                                            {
+                                                                if (inf.DeliveryCount >= this.numberOfRetry)
+                                                                {
+                                                                    Trace.TraceError(
+                                                                        "{0}|{1}|{2}",
+                                                                        e.GetBaseException().GetType(),
+                                                                        ActivityOperationName,
+                                                                        e);
+                                                                }
+                                                                else
+                                                                {
+                                                                    Trace.TraceWarning(
+                                                                        "{0}|{1}|{2}",
+                                                                        e.GetBaseException().GetType(),
+                                                                        ActivityOperationName,
+                                                                        e);
+                                                                }
+
+                                                                executeActivtyOperation.SetResult(OperationResult.Failure);
+                                                                throw;
+                                                            }
+                                                        }
+                                                    },
+                                                null);
+                                    },
+                                        (c, inf) =>
+                                        {
+                                            //This code is executed in case of exception.
+                                            //We need to do a delay between message processing to avoid breaking sequensing
+                                            Thread.Sleep(30 * 1000);
+                                        }
+                                    );
+
+                            this.completedEvent.WaitOne();
+                        }
+
+                        Trace.TraceInformation("{0}|{1}|Wait for next processing cycle...", MetricDataTypeDefault, RunWorkerRoleOperationName);
+                        Thread.Sleep(5 * 60 * 1000);
+                    }
+
+                    runWorkerRoleOperation.SetResult(OperationResult.Success);
+                }
+                catch (Exception e)
+                {
+                    Trace.TraceError("{0}|{1}|{2}", e.GetBaseException().GetType(), RunWorkerRoleOperationName, e);
+                    runWorkerRoleOperation.SetResult(OperationResult.Failure);
+                    throw;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Executes on role start.
+        /// </summary>
+        /// <returns>Returns bool, if role can start.</returns>
+        public override bool OnStart()
+        {
+            ApplicationInsights.Extensibility.TelemetryConfiguration.Active.InstrumentationKey =
+                CloudConfigurationManager.GetSetting("AInsightsKey");
+            AppDomain.CurrentDomain.UnhandledException += AppDomainUnhandledExceptionHandler;
+            var currentConfigName = CloudConfigurationManager.GetSetting("AppConfigName");
+            AppConfig.Change(string.Format(@"{0}\{1}", AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\'), currentConfigName));
+            Trace.Refresh();
+            this.numberOfRetry = int.Parse(CloudConfigurationManager.GetSetting("NumberOfRetry"));
+            // Trace.Refresh() will have loaded a configured IfxLogTraceListener by this point.
+            const string OperationName = "Start Worker Role";
+            Trace.TraceInformation("{0}|{1}|Start {2}...", MetricDataTypeDefault, OperationName, this.ServiceRoleInstance.Id);
+            using (var operation = new Operation(OperationName))
+            {
+                try
+                {
+                    Trace.TraceInformation(
+                        "{0}|{1}|Configuration loaded for '{2}'...",
+                        MetricDataTypeDefault,
+                        OperationName,
+                        ConfigurationManager.AppSettings["ConfigEnv"]);
+                    var startResult = base.OnStart();
+                    this.heartbeat = new Heartbeat(this.ServiceRoleInstance.Id);
+                    this.heartbeat.StartHeartbeat();
+                    Trace.TraceInformation("{0}|{1}|{2} started.", MetricDataTypeDefault, OperationName, this.ServiceRoleInstance.Id);
+                    operation.SetResult(OperationResult.Success);
+                    return startResult;
+                }
+                catch (Exception e)
+                {
+                    Trace.TraceError("{0}|{1}|{2}", e.GetBaseException().GetType(), OperationName, e);
+                    operation.SetResult(OperationResult.Failure);
+                    throw;
+                }
+            }
+        }
+
+        /// <summary>Executes on role stop.</summary>
+        public override void OnStop()
+        {
+            const string OperationName = "Stop Worker Role";
+            Trace.TraceInformation("{0}|{1}|Stop {2}...", MetricDataTypeDefault, OperationName, this.ServiceRoleInstance.Id);
+            using (var operation = new Operation(OperationName))
+            {
+                try
+                {
+                    this.cancellationTokenSource.Cancel();
+                    this.completedEvent.Set();
+                    base.OnStop();
+                    Trace.TraceInformation("{0}|{1}|{2} stopped.", MetricDataTypeDefault, OperationName, this.ServiceRoleInstance.Id);
+                    operation.SetResult(OperationResult.Success);
+                }
+                catch (Exception e)
+                {
+                    Trace.TraceError("{0}|{1}|{2}", e.GetBaseException().GetType(), OperationName, e);
+                    operation.SetResult(OperationResult.Failure);
+                    throw;
+                }
+            }
+        }
+
+        #endregion
+        #region Methods - Private Static
+
+        /// <summary>Handles App domain unhandled exceptions.</summary>
+        /// <param name="sender">The object in which the exception was thrown.</param>
+        /// <param name="e">The unhandled exception.</param>
+        private static void AppDomainUnhandledExceptionHandler(object sender, UnhandledExceptionEventArgs e)
+        {
+            var exception = ((Exception)e.ExceptionObject);
+            Trace.TraceError("{0}|Unhandled Exception|An unhandled exception occurred: {1}", exception.GetBaseException().GetType(), exception);
+        }
+
+        #endregion
+    }
+}
